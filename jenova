@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+#
+# Help
+#
+if
+    [ "${1}" == "" ] \
+        || [ "${2}" == "" ]
+then
+    echo 'usage: jenova [ip] [image-name] [additional folder to sync] [...]'
+    exit 1
+fi
+
+#
+# Trap
+#
+onSigInt () {
+    echo ""
+    echo "CTRL-C received!"
+
+    if
+        [ "${ID}" != "" ]
+    then
+        echo "Stopping temporary container..."
+        docker rm -f ${ID} > /dev/null
+    fi
+
+    exit 1
+}
+
+trap onSigInt INT
+
+#
+# Arguments
+#
+IP="${1}"
+IMAGE_NAME="${2}"
+shift 2
+
+#
+# Files
+#
+FILES="
+/etc
+/opt
+/root
+"
+
+for file in "$@"
+do
+    FILES="${FILES}
+${file}
+"
+done
+
+#
+# Pick package manager
+#
+if
+    ssh ${IP} 'which rpm' &> /dev/null
+then
+    list="rpm -qal"
+elif
+    ssh ${IP} 'which dpkg' &> /dev/null
+then
+    list="dpkg --get-selections | grep -v deinstall | cut -f1 | xargs dpkg-query -L"
+else
+    echo 'Could not recognize the remote operating system. Cowardly exitting...'
+    exit 1
+fi
+
+#
+# Let's get started
+#
+echo "Importing files from ${IP} to docker image ${IMAGE_NAME}..."
+
+#
+# We create a base image if it doesn't exist yet
+#
+if
+    ! (docker images | grep -qs "^${IMAGE_NAME} ")
+then
+    echo "Creating base image for ${IMAGE_NAME} by syncing installed packages from remote..."
+    ssh ${IP} "${list} | sudo tar --absolute-names --no-recursion -cf - -T -" | pv | docker import - ${IMAGE_NAME}
+else
+    echo "Base image already exists..."
+fi
+
+#
+# We start a container, apply additional changes, and then save it
+# to a new copy of the image
+#
+echo "Starting temporary container..."
+ID="$(docker create -i ${IMAGE_NAME} tar xf -)"
+docker start ${ID} > /dev/null
+
+for file in ${FILES}
+do
+    echo "Syncing ${file}..."
+    ssh ${IP} "sudo tar --absolute-names -cf - ${file}" \
+        | pv \
+        | docker exec -i ${ID} tar --overwrite -xf -
+done
+
+echo "Committing temporary container to ${IMAGE_NAME}"...
+docker commit --message "Image built with Jenova" \
+    ${ID} ${IMAGE_NAME}:latest > /dev/null
+
+echo "Stopping and removing temporary container..."
+docker rm -f ${ID} > /dev/null
+
+echo "Completed!"
